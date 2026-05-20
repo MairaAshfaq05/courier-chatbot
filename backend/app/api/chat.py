@@ -137,7 +137,7 @@ async def delete_history(
 # ── Escalation endpoints ──────────────────────────────────────────────────────
 @router.post("/escalate", response_model=EscalationOut)
 async def escalate(
-    req: EscalationRequestSchema,   # <-- Using Pydantic schema, not SQLAlchemy model
+    req: EscalationRequestSchema,   # <-- Pydantic schema
     db: AsyncSession = Depends(get_db),
     current_user: Optional[User] = Depends(get_current_user),
 ):
@@ -290,7 +290,7 @@ async def accept_escalation(
     return {"success": True, "session_id": conv.session_id, "agent_name": current_user.name}
 
 
-# ── Agent status and heartbeat (unchanged, but add missing imports)
+# ── Agent status and heartbeat ────────────────────────────────────────────────
 @router.get("/agents/status")
 async def agents_status(db: AsyncSession = Depends(get_db)):
     agents = await get_agents_status(db)
@@ -329,6 +329,7 @@ async def agent_offline(agent_id: int, db: AsyncSession = Depends(get_db)):
     agent.last_seen = datetime.now()
     await db.commit()
     return {"status": "offline"}
+
 
 # ── QR Scan endpoints (unchanged) ─────────────────────────────────────────────
 @router.get("/qr/shipment/{tracking_number}")
@@ -433,164 +434,3 @@ async def qr_refund(
         "message":    f"Your {refund_type} request has been submitted. Our team will review within 2–3 business days.",
     }
 
-
-
-# ── Escalation (new) ──────────────────────────────────────────────────────────
-@router.post("/escalate", response_model=EscalationOut)
-async def escalate(
-    req: EscalationRequestSchema,
-    db: AsyncSession = Depends(get_db),
-    current_user: Optional[User] = Depends(get_current_user),
-):
-    """User requests escalation to human agent. Creates a pending request."""
-    result = await db.execute(select(Conversation).where(Conversation.session_id == req.session_id))
-    conv = result.scalar_one_or_none()
-    if not conv:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    
-    # Check if already escalated
-    if conv.is_escalated:
-        return EscalationOut(
-            session_id=req.session_id,
-            escalated=True,
-            agent_name=conv.agent_rel.name if conv.agent_rel else "Agent",
-            estimated_wait="Already connected",
-            ticket_number="N/A"
-        )
-    
-    # Check if there's already a pending escalation
-    existing = await db.execute(
-        select(EscalationRequest).where(
-            and_(EscalationRequest.conversation_id == conv.id, EscalationRequest.status == "pending")
-        )
-    )
-    if existing.scalar_one_or_none():
-        return EscalationOut(
-            session_id=req.session_id,
-            escalated=False,
-            agent_name="",
-            estimated_wait="Pending...",
-            ticket_number=""
-        )
-    
-    # Create new escalation request
-    ticket = "TKT" + "".join(random.choices(string.digits, k=8))
-    esc_req = EscalationRequest(
-        conversation_id=conv.id,
-        user_id=current_user.id if current_user else None,
-        status="pending"
-    )
-    db.add(esc_req)
-    await db.commit()
-    
-    return EscalationOut(
-        session_id=req.session_id,
-        escalated=False,
-        agent_name="Waiting for agent",
-        estimated_wait="Pending",
-        ticket_number=ticket
-    )
-
-
-@router.get("/escalation/status/{session_id}")
-async def escalation_status(
-    session_id: str,
-    db: AsyncSession = Depends(get_db),
-):
-    """Check if an escalation request has been accepted."""
-    result = await db.execute(select(Conversation).where(Conversation.session_id == session_id))
-    conv = result.scalar_one_or_none()
-    if not conv:
-        return {"escalated": False, "agent_name": None}
-    
-    # If already escalated, return agent info
-    if conv.is_escalated and conv.agent_id:
-        agent = await db.execute(select(User).where(User.id == conv.agent_id))
-        agent_obj = agent.scalar_one_or_none()
-        return {"escalated": True, "agent_name": agent_obj.name if agent_obj else "Agent"}
-    
-    # Check if there's an accepted request
-    esc_req = await db.execute(
-        select(EscalationRequest).where(
-            and_(EscalationRequest.conversation_id == conv.id, EscalationRequest.status == "accepted")
-        )
-    )
-    accepted = esc_req.scalar_one_or_none()
-    if accepted:
-        return {"escalated": True, "agent_name": "Agent"}
-    
-    return {"escalated": False, "agent_name": None}
-
-
-@router.get("/escalation/pending")
-async def pending_escalations(
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_agent),  # only agents
-):
-    """Agent endpoint: list all pending escalation requests with conversation details."""
-    result = await db.execute(
-        select(EscalationRequest, Conversation, User)
-        .join(Conversation, EscalationRequest.conversation_id == Conversation.id)
-        .outerjoin(User, Conversation.user_id == User.id)
-        .where(EscalationRequest.status == "pending")
-        .order_by(EscalationRequest.created_at)
-    )
-    rows = result.all()
-    pending = []
-    for esc, conv, user in rows:
-        # Get last few messages (optional)
-        msg_result = await db.execute(
-            select(Message).where(Message.conversation_id == conv.id).order_by(Message.created_at.desc()).limit(5)
-        )
-        last_messages = [{"role": m.role, "content": m.content, "created_at": m.created_at.isoformat()} for m in msg_result.scalars().all()]
-        pending.append({
-            "id": esc.id,
-            "session_id": conv.session_id,
-            "user_name": user.name if user else "Anonymous",
-            "user_email": user.email if user else None,
-            "created_at": esc.created_at.isoformat(),
-            "last_tracking_number": conv.last_tracking_number,
-            "last_messages": last_messages[::-1],  # oldest first
-        })
-    return {"pending": pending}
-
-
-@router.post("/escalation/accept/{escalation_id}")
-async def accept_escalation(
-    escalation_id: int,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_agent),
-):
-    """Agent accepts an escalation. Marks conversation as escalated and adds system message."""
-    result = await db.execute(
-        select(EscalationRequest).where(EscalationRequest.id == escalation_id)
-    )
-    esc = result.scalar_one_or_none()
-    if not esc:
-        raise HTTPException(status_code=404, detail="Escalation request not found")
-    if esc.status != "pending":
-        raise HTTPException(status_code=400, detail="Already processed")
-    
-    # Update escalation request
-    esc.status = "accepted"
-    esc.accepted_at = datetime.now()
-    
-    # Update conversation
-    conv_result = await db.execute(select(Conversation).where(Conversation.id == esc.conversation_id))
-    conv = conv_result.scalar_one()
-    conv.is_escalated = True
-    conv.agent_id = current_user.id
-    conv.escalated_at = datetime.now()
-    
-    # Add system message that agent joined
-    agent_msg = Message(
-        conversation_id=conv.id,
-        role="agent",
-        content=f"🧑‍💼 **Agent {current_user.name} has joined the chat.**\n\nHello! I'm {current_user.name}. I can see your conversation history. How can I help you today?",
-        language=conv.language,
-    )
-    db.add(agent_msg)
-    
-    await db.commit()
-    
-    return {"success": True, "session_id": conv.session_id, "agent_name": current_user.name}
