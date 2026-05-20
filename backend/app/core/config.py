@@ -4,7 +4,7 @@ from typing import List
 
 class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql+asyncpg://postgres:password@localhost:5432/courier_chatbot"
-    SECRET_KEY: str = "123"
+    SECRET_KEY: str = "d57549c5cceb25d7150492364a4239c738ee78ad63ce225d6e048cb819af8c7e"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 10080
     REDIS_URL: str = "redis://localhost:6379"
